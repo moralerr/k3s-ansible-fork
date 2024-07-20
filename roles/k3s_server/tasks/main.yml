@@ -1,23 +1,38 @@
 ---
-# If airgapped, all K3s artifacts are already on the node.
-- name: Download K3s install script
-  when: airgap_dir is undefined
-  ansible.builtin.get_url:
-    url: https://get.k3s.io/
-    timeout: 120
-    dest: /usr/local/bin/k3s-install.sh
-    owner: root
-    group: root
-    mode: 0755
+- name: Get k3s installed version
+  ansible.builtin.command: k3s --version
+  register: k3s_version_output
+  changed_when: false
+  ignore_errors: true
 
-- name: Download K3s binary
-  when: airgap_dir is undefined
-  ansible.builtin.command:
-    cmd: /usr/local/bin/k3s-install.sh
-  environment:
-    INSTALL_K3S_SKIP_START: "true"
-    INSTALL_K3S_VERSION: "{{ k3s_version }}"
-  changed_when: true
+- name: Set k3s installed version
+  when: k3s_version_output.rc == 0
+  ansible.builtin.set_fact:
+    installed_k3s_version: "{{ k3s_version_output.stdout_lines[0].split(' ')[2] }}"
+
+# If airgapped, all K3s artifacts are already on the node.
+# We should be downloading and installing the newer version only if we are in one of the following cases :
+#   - we couldn't get k3s installed version in the first task of this role
+#   - the installed version of K3s on the nodes is older than the requested version in ansible vars
+- name: Download artifact only if needed
+  when: k3s_version_output.rc != 0 or installed_k3s_version is version(k3s_version, '<') and airgap_dir is undefined
+  block:
+    - name: Download K3s install script
+      ansible.builtin.get_url:
+        url: https://get.k3s.io/
+        timeout: 120
+        dest: /usr/local/bin/k3s-install.sh
+        owner: root
+        group: root
+        mode: "0755"
+
+    - name: Download K3s binary
+      ansible.builtin.command:
+        cmd: /usr/local/bin/k3s-install.sh
+      environment:
+        INSTALL_K3S_SKIP_START: "true"
+        INSTALL_K3S_VERSION: "{{ k3s_version }}"
+      changed_when: true
 
 - name: Add K3s autocomplete to user bashrc
   ansible.builtin.lineinfile:
@@ -31,34 +46,38 @@
     - name: Make config directory
       ansible.builtin.file:
         path: "/etc/rancher/k3s"
-        mode: 0755
+        mode: "0755"
         state: directory
     - name: Copy config values
       ansible.builtin.copy:
         content: "{{ server_config_yaml }}"
         dest: "/etc/rancher/k3s/config.yaml"
-        mode: 0644
+        mode: "0644"
 
 - name: Init first server node
-  when: inventory_hostname == groups['server'][0]
+  when: inventory_hostname == groups[server_group][0]
   block:
     - name: Copy K3s service file [Single]
-      when: groups['server'] | length == 1
+      when: groups[server_group] | length == 1 or use_external_database
       ansible.builtin.template:
         src: "k3s-single.service.j2"
         dest: "{{ systemd_dir }}/k3s.service"
         owner: root
         group: root
-        mode: 0644
+        mode: "0644"
+      register: service_file_single
 
     - name: Copy K3s service file [HA]
-      when: groups['server'] | length > 1
+      when:
+        - groups[server_group] | length > 1
+        - not use_external_database
       ansible.builtin.template:
         src: "k3s-cluster-init.service.j2"
         dest: "{{ systemd_dir }}/k3s.service"
         owner: root
         group: root
-        mode: 0644
+        mode: "0644"
+      register: service_file_ha
 
     - name: Add service environment variables
       when: extra_service_envs is defined
@@ -67,7 +86,18 @@
         line: "{{ item }}"
       with_items: "{{ extra_service_envs }}"
 
+    - name: Restart K3s service
+      when:
+        - ansible_facts.services['k3s.service'] is defined
+        - ansible_facts.services['k3s.service'].state == 'running'
+        - service_file_single.changed or service_file_ha.changed
+      ansible.builtin.systemd:
+        name: k3s
+        daemon_reload: true
+        state: restarted
+
     - name: Enable and check K3s service
+      when: ansible_facts.services['k3s.service'] is not defined or ansible_facts.services['k3s.service'].state != 'running'
       ansible.builtin.systemd:
         name: k3s
         daemon_reload: true
@@ -75,7 +105,7 @@
         enabled: true
 
     - name: Pause to allow first server startup
-      when: (groups['server'] | length) > 1
+      when: (groups[server_group] | length) > 1
       ansible.builtin.pause:
         seconds: 10
 
@@ -87,8 +117,20 @@
       become: false
       changed_when: false
 
+    # Copy the k3s config to a second file to detect changes.
+    # If no changes are found, we can skip copying the kubeconfig to the control node.
+    - name: Copy k3s.yaml to second file
+      ansible.builtin.copy:
+        src: /etc/rancher/k3s/k3s.yaml
+        dest: /etc/rancher/k3s/k3s-copy.yaml
+        mode: "0600"
+        remote_src: true
+      register: copy_k3s_yaml_file
+
     - name: Apply K3S kubeconfig to control node
-      when: kubectl_installed.rc == 0
+      when:
+        - kubectl_installed.rc == 0
+        - copy_k3s_yaml_file.changed
       block:
         - name: Copy kubeconfig to control node
           ansible.builtin.fetch:
@@ -105,12 +147,12 @@
           changed_when:
             - csa_result.rc == 0
 
-        - name: Setup kubeconfig k3s-ansible context on control node
+        - name: Setup kubeconfig context on control node - {{ cluster_context }}
           when: kubeconfig != "~/.kube/config"
           ansible.builtin.replace:
             path: "{{ kubeconfig }}"
             regexp: 'name: default'
-            replace: 'name: k3s-ansible'
+            replace: 'name: {{ cluster_context }}'
           delegate_to: 127.0.0.1
           become: false
 
@@ -118,7 +160,7 @@
           when: kubeconfig != "~/.kube/config"
           ansible.builtin.shell: |
             TFILE=$(mktemp)
-            KUBECONFIG={{ kubeconfig }} kubectl config set-context k3s-ansible --user=k3s-ansible --cluster=k3s-ansible
+            KUBECONFIG={{ kubeconfig }} kubectl config set-context {{ cluster_context }} --user={{ cluster_context }} --cluster={{ cluster_context }}
             KUBECONFIG={{ kubeconfig }} kubectl config view --flatten > ${TFILE}
             mv ${TFILE} {{ kubeconfig }}
           delegate_to: 127.0.0.1
@@ -129,19 +171,45 @@
 
 - name: Start other server if any and verify status
   when:
-    - (groups['server'] | length) > 1
-    - inventory_hostname != groups['server'][0]
+    - (groups[server_group] | length) > 1
+    - inventory_hostname != groups[server_group][0]
   block:
     - name: Copy K3s service file [HA]
-      when: groups['server'] | length > 1
+      when:
+        - groups[server_group] | length > 1
+        - not use_external_database
       ansible.builtin.template:
         src: "k3s-ha.service.j2"
         dest: "{{ systemd_dir }}/k3s.service"
         owner: root
         group: root
-        mode: 0644
+        mode: "0644"
+      register: service_file_ha
+
+    - name: Copy K3s service file [External DB]
+      when:
+        - groups[server_group] | length > 1
+        - use_external_database
+      ansible.builtin.template:
+        src: "k3s-single.service.j2"
+        dest: "{{ systemd_dir }}/k3s.service"
+        owner: root
+        group: root
+        mode: "0644"
+      register: service_file_external_db
+
+    - name: Restart K3s service
+      when:
+        - ansible_facts.services['k3s.service'] is defined
+        - ansible_facts.services['k3s.service'].state == 'running'
+        - service_file_ha.changed or service_file_external_db.changed
+      ansible.builtin.systemd:
+        name: k3s
+        daemon_reload: true
+        state: restarted
 
     - name: Enable and check K3s service
+      when: ansible_facts.services['k3s.service'] is not defined or ansible_facts.services['k3s.service'].state != 'running'
       ansible.builtin.systemd:
         name: k3s
         daemon_reload: true
@@ -149,12 +217,12 @@
         enabled: true
 
     - name: Verify that all server nodes joined
-      when: (groups['server'] | length) > 1
+      when: (groups[server_group] | length) > 1
       ansible.builtin.command:
         cmd: >
           k3s kubectl get nodes -l "node-role.kubernetes.io/control-plane=true" -o=jsonpath="{.items[*].metadata.name}"
       register: nodes
-      until: nodes.rc == 0 and (nodes.stdout.split() | length) == (groups['server'] | length)
+      until: nodes.rc == 0 and (nodes.stdout.split() | length) == (groups[server_group] | length)
       retries: 20
       delay: 10
       changed_when: false

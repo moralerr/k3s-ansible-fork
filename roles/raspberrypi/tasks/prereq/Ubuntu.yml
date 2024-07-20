@@ -1,5 +1,6 @@
 ---
 - name: Enable cgroup via boot commandline if not already enabled
+  when: lookup('fileglob', '/boot/firmware/cmdline.txt', errors='warn') | length > 0
   ansible.builtin.lineinfile:
     path: /boot/firmware/cmdline.txt
     backrefs: true
@@ -14,4 +15,4 @@
     name: linux-modules-extra-raspi
     update_cache: true
     state: present
-  when: "ansible_distribution_version is version('20.10', '>=')"
+  when: "ansible_distribution_version is version('20.10', '>=') and ansible_distribution_version is version('24.04', '<')"
